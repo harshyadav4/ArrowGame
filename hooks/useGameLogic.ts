@@ -18,6 +18,7 @@ import {
   getMuteState,
   toggleMute as toggleAudioMute,
 } from '../utils/audio';
+import { supabase } from '../utils/supabase';
 
 export interface GameState {
   paths: GridPaths;
@@ -80,6 +81,11 @@ export const useGameLogic = (maxHearts = 3) => {
   const [isSolverRunning, setIsSolverRunning] = useState<boolean>(false);
   const [isHintGlowing, setIsHintGlowing] = useState<boolean>(false);
 
+  // Supabase Auth and Sync State
+  const [user, setUser] = useState<{ id: string; email?: string; display_name?: string; username?: string } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline' | 'error'>('offline');
+  const isInitialLoadRef = useRef<boolean>(true);
+
   // Refs for tracking async variables
   const activePathsRef = useRef<GridPaths>([]);
   const nextSolveStepResolveRef = useRef<(() => void) | null>(null);
@@ -120,6 +126,175 @@ export const useGameLogic = (maxHearts = 3) => {
 
     return () => clearTimeout(deferTimer);
   }, []);
+
+  // Sign out logic
+  const signOut = useCallback(async () => {
+    try {
+      await supabase.auth.signOut();
+      setUser(null);
+      setSyncStatus('offline');
+      // Reset progress to whatever is in local storage
+      const localLevel = parseInt(safeLocalStorageGet('arrow_exit_campaign_level') || '0', 10);
+      const localHints = parseInt(safeLocalStorageGet('arrow_exit_hints_count') || '3', 10);
+      setCampaignIndex(localLevel);
+      setHintsCount(localHints);
+    } catch (err) {
+      console.error('Error signing out:', err);
+    }
+  }, []);
+
+  // Load and merge progress from cloud
+  const fetchUserProfileAndProgress = useCallback(async (authUser: any) => {
+    setSyncStatus('syncing');
+    isInitialLoadRef.current = true;
+    try {
+      // 1. Get profile details
+      const { data: profile, error: profileErr } = await supabase
+        .from('profiles')
+        .select('username, display_name, avatar_url')
+        .eq('id', authUser.id)
+        .single();
+
+      if (profileErr) throw profileErr;
+
+      // 2. Get game progress
+      let { data: progress, error: progressErr } = await supabase
+        .from('user_progress')
+        .select('campaign_index, hints_count')
+        .eq('user_id', authUser.id)
+        .maybeSingle();
+
+      if (progressErr) throw progressErr;
+
+      // If progress doesn't exist, create it (should be handled by trigger, but fail-safe)
+      if (!progress) {
+        const { data: newProgress, error: insertErr } = await supabase
+          .from('user_progress')
+          .insert({
+            user_id: authUser.id,
+            campaign_index: 0,
+            hints_count: 3,
+          })
+          .select()
+          .single();
+        if (insertErr) throw insertErr;
+        progress = newProgress;
+      }
+
+      setUser({
+        id: authUser.id,
+        email: authUser.email,
+        display_name: profile.display_name,
+        username: profile.username,
+      });
+
+      // 3. Sync merging logic (use local or cloud, whichever is higher level)
+      const localLvl = parseInt(safeLocalStorageGet('arrow_exit_campaign_level') || '0', 10);
+      const localHints = parseInt(safeLocalStorageGet('arrow_exit_hints_count') || '3', 10);
+      const cloudLvl = progress?.campaign_index ?? 0;
+      const cloudHints = progress?.hints_count ?? 3;
+
+      if (localLvl > cloudLvl) {
+        // Sync local to cloud
+        await supabase
+          .from('user_progress')
+          .update({
+            campaign_index: localLvl,
+            hints_count: localHints,
+          })
+          .eq('user_id', authUser.id);
+        
+        setCampaignIndex(localLvl);
+        setHintsCount(localHints);
+      } else {
+        // Load cloud progress and overwrite local storage
+        setCampaignIndex(cloudLvl);
+        setHintsCount(cloudHints);
+        safeLocalStorageSet('arrow_exit_campaign_level', cloudLvl.toString());
+        safeLocalStorageSet('arrow_exit_hints_count', cloudHints.toString());
+      }
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error('Error fetching Supabase progress:', err);
+      setSyncStatus('error');
+      setUser({
+        id: authUser.id,
+        email: authUser.email,
+      });
+    } finally {
+      // Let the sync effect know it can start watching for updates
+      setTimeout(() => {
+        isInitialLoadRef.current = false;
+      }, 100);
+    }
+  }, []);
+
+  // Listen for Auth changes
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        fetchUserProfileAndProgress(session.user);
+      } else {
+        setUser(null);
+        setSyncStatus('offline');
+        isInitialLoadRef.current = false;
+      }
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (session?.user) {
+          await fetchUserProfileAndProgress(session.user);
+        } else {
+          setUser(null);
+          setSyncStatus('offline');
+          isInitialLoadRef.current = false;
+        }
+      }
+    );
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [fetchUserProfileAndProgress]);
+
+  // Sync state changes to cloud
+  const syncProgressToCloud = useCallback(async (level: number, hints: number) => {
+    if (isInitialLoadRef.current) return;
+    
+    // Get session first to ensure we have auth
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session?.user) return;
+
+    setSyncStatus('syncing');
+    try {
+      const { error } = await supabase
+        .from('user_progress')
+        .update({
+          campaign_index: level,
+          hints_count: hints,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', session.user.id);
+
+      if (error) throw error;
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error('Failed to sync progress to cloud:', err);
+      setSyncStatus('error');
+    }
+  }, []);
+
+  // Sync changes in campaignIndex or hintsCount to Cloud
+  useEffect(() => {
+    if (!user || isInitialLoadRef.current) return;
+
+    const timer = setTimeout(() => {
+      syncProgressToCloud(campaignIndex, hintsCount);
+    }, 800); // 800ms debounce
+
+    return () => clearTimeout(timer);
+  }, [campaignIndex, hintsCount, user, syncProgressToCloud]);
 
   // Helper to deep copy paths
   const copyPaths = useCallback((src: GridPaths): GridPaths => {
@@ -404,6 +579,9 @@ export const useGameLogic = (maxHearts = 3) => {
     isSolverRunning,
     isHintGlowing,
     maxHearts,
+    user,
+    syncStatus,
+    signOut,
     toggleSound,
     handleReset,
     handleHint,
