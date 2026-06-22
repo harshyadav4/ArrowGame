@@ -18,8 +18,8 @@ const outfit = Outfit({
 });
 
 export const metadata: Metadata = {
-  title: "Flow Maze",
-  description: "Play the Maze Game",
+  title: "Arrow Exit",
+  description: "Play the Arrow Exit Game",
 };
 
 export default function RootLayout({
