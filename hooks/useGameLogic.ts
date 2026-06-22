@@ -84,6 +84,7 @@ export const useGameLogic = (maxHearts = 3) => {
   const activePathsRef = useRef<GridPaths>([]);
   const nextSolveStepResolveRef = useRef<(() => void) | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const collisionSoundPromiseRef = useRef<Promise<void> | null>(null);
 
   // Keep ref in sync
   useEffect(() => {
@@ -322,7 +323,7 @@ export const useGameLogic = (maxHearts = 3) => {
       // Collision recoil animation trigger
       setAnimatingPathId(clickedPath.id);
       setAnimationType('collide');
-      playCollisionSound();
+      collisionSoundPromiseRef.current = playCollisionSound();
     } else {
       // Smooth Exit flight trigger
       setAnimatingPathId(clickedPath.id);
@@ -348,8 +349,16 @@ export const useGameLogic = (maxHearts = 3) => {
       setMoves(prev => prev + 1);
 
       if (newHearts <= 0) {
-        setIsGameOver(true);
-        playGameOverSound();
+        if (collisionSoundPromiseRef.current) {
+          collisionSoundPromiseRef.current.then(() => {
+            setIsGameOver(true);
+            playGameOverSound();
+            collisionSoundPromiseRef.current = null;
+          });
+        } else {
+          setIsGameOver(true);
+          playGameOverSound();
+        }
       }
 
       // If solver is running, resolve promise

@@ -70,11 +70,17 @@ export function playMoveSound() {
   osc.stop(ctx.currentTime + 0.15);
 }
 
-export function playCollisionSound() {
-  if (isMuted) return;
-  const ctx = getAudioContext();
-  if (!ctx) return;
+let cachedWrongMoveAudio: HTMLAudioElement | null = null;
 
+function getWrongMoveAudio(): HTMLAudioElement | null {
+  if (typeof window === 'undefined') return null;
+  if (!cachedWrongMoveAudio) {
+    cachedWrongMoveAudio = new Audio('/faaah.mp3');
+  }
+  return cachedWrongMoveAudio;
+}
+
+function playSyntheticCollisionSound(ctx: AudioContext) {
   // Synthesis for a double buzz / crash
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
@@ -99,6 +105,58 @@ export function playCollisionSound() {
   osc2.start();
   osc1.stop(ctx.currentTime + 0.2);
   osc2.stop(ctx.currentTime + 0.2);
+}
+
+export function playCollisionSound(): Promise<void> {
+  if (isMuted) return Promise.resolve();
+  
+  const audio = getWrongMoveAudio();
+  if (audio) {
+    return new Promise<void>((resolve) => {
+      audio.currentTime = 0;
+      
+      const onEnded = () => {
+        audio.removeEventListener('ended', onEnded);
+        audio.removeEventListener('error', onError);
+        resolve();
+      };
+      
+      const onError = () => {
+        audio.removeEventListener('ended', onEnded);
+        audio.removeEventListener('error', onError);
+        const ctx = getAudioContext();
+        if (ctx) {
+          playSyntheticCollisionSound(ctx);
+          setTimeout(resolve, 200);
+        } else {
+          resolve();
+        }
+      };
+
+      audio.addEventListener('ended', onEnded);
+      audio.addEventListener('error', onError);
+
+      audio.play().catch(e => {
+        console.warn("Failed to play wrong move audio, falling back to synthetic sound:", e);
+        audio.removeEventListener('ended', onEnded);
+        audio.removeEventListener('error', onError);
+        const ctx = getAudioContext();
+        if (ctx) {
+          playSyntheticCollisionSound(ctx);
+          setTimeout(resolve, 200);
+        } else {
+          resolve();
+        }
+      });
+    });
+  } else {
+    const ctx = getAudioContext();
+    if (ctx) {
+      playSyntheticCollisionSound(ctx);
+      return new Promise<void>(resolve => setTimeout(resolve, 200));
+    }
+    return Promise.resolve();
+  }
 }
 
 export function playWinSound() {
